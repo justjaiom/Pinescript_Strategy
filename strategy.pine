@@ -1,0 +1,320 @@
+//@version=5
+strategy("Supply & Demand Liquidity Sweep Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.1, max_boxes_count=50, max_labels_count=50)
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// Risk Management
+riskPercent = input.float(1.0, "Risk Per Trade (%)", minval=0.1, maxval=5.0, step=0.1, group="Risk Management")
+rewardRiskRatio = input.float(2.0, "Reward:Risk Ratio", minval=1.0, maxval=5.0, step=0.1, group="Risk Management")
+maxTrades = input.int(3, "Max Concurrent Trades", minval=1, maxval=10, group="Risk Management")
+
+// Supply & Demand Zones
+swingLength = input.int(10, "Swing Detection Length", minval=5, maxval=50, group="Supply & Demand")
+zoneStrength = input.int(3, "Zone Strength (Tests)", minval=1, maxval=10, group="Supply & Demand")
+wickSensitivity = input.float(0.3, "Wick Rejection Sensitivity", minval=0.1, maxval=1.0, step=0.1, group="Supply & Demand")
+maxZones = input.int(5, "Max Zones to Track", minval=3, maxval=10, group="Supply & Demand")
+
+// Liquidity Sweep Settings
+sweepLookback = input.int(20, "Liquidity Sweep Lookback", minval=10, maxval=100, group="Liquidity Sweep")
+sweepConfirmBars = input.int(2, "Sweep Confirmation Bars", minval=1, maxval=5, group="Liquidity Sweep")
+minSweepDistance = input.float(0.1, "Min Sweep Distance (%)", minval=0.05, maxval=1.0, step=0.05, group="Liquidity Sweep")
+
+// Session Settings
+useSessionFilter = input.bool(true, "Use Session Filter", group="Session Settings")
+londonSession = input.session("0800-1600", "London Session", group="Session Settings")
+nySession = input.session("1330-2000", "New York Session", group="Session Settings")
+
+// Visual Settings
+showZones = input.bool(true, "Show Supply/Demand Zones", group="Visual")
+showSweeps = input.bool(true, "Show Liquidity Sweeps", group="Visual")
+showPrevLevels = input.bool(true, "Show Previous Day Levels", group="Visual")
+
+// ============================================================================
+// CONSTANTS AND VARIABLES
+// ============================================================================
+
+var float prevDayHigh = na
+var float prevDayLow = na
+var float prevDayClose = na
+var float prevDayOpen = na
+var float sessionOpen = na
+var float sessionHigh = na
+var float sessionLow = na
+var bool bullishSweep = false
+var bool bearishSweep = false
+var float sweepLevel = na
+var int sweepBar = na
+
+// Fixed-size arrays for better memory management
+var supplyZones = array.new<float>(maxZones * 2)
+var demandZones = array.new<float>(maxZones * 2)
+var supplyBoxes = array.new<box>(maxZones)
+var demandBoxes = array.new<box>(maxZones)
+
+// ============================================================================
+// SESSION AND TIME FUNCTIONS
+// ============================================================================
+
+inLondonSession = not na(time(timeframe.period, londonSession))
+inNYSession = not na(time(timeframe.period, nySession))
+inTradingSession = useSessionFilter ? (inLondonSession or inNYSession) : true
+
+// Previous day levels - optimized with single calculation per day
+newDay = ta.change(time("1D"))
+if newDay
+    prevDayHigh := high[1]
+    prevDayLow := low[1]
+    prevDayClose := close[1]
+    prevDayOpen := open[1]
+
+// Session tracking - optimized
+sessionChange = newDay or (useSessionFilter and (ta.change(time(timeframe.period, londonSession)) or ta.change(time(timeframe.period, nySession))))
+if sessionChange
+    sessionOpen := open
+    sessionHigh := high
+    sessionLow := low
+else
+    sessionHigh := math.max(nz(sessionHigh, high), high)
+    sessionLow := math.min(nz(sessionLow, low), low)
+
+// ============================================================================
+// OPTIMIZED HELPER FUNCTIONS
+// ============================================================================
+
+// Cached calculations to avoid repetitive computations
+atr14 = ta.atr(14)
+volume_ma = ta.sma(volume, 10)
+
+// Optimized wick rejection calculation
+wickRejectionStrength(highPrice, lowPrice, openPrice, closePrice, isSupply) =>
+    bodySize = math.abs(closePrice - openPrice)
+    wickSize = isSupply ? highPrice - math.max(openPrice, closePrice) : math.min(openPrice, closePrice) - lowPrice
+    totalSize = highPrice - lowPrice
+    totalSize > 0 ? (wickSize / totalSize > wickSensitivity and bodySize / totalSize < 0.7) : false
+
+// Memory-efficient zone management
+addSupplyZone(zoneTop, zoneBottom) =>
+    if array.size(supplyZones) >= maxZones * 2
+        array.shift(supplyZones)
+        array.shift(supplyZones)
+        oldBox = array.shift(supplyBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+    
+    array.push(supplyZones, zoneBottom)
+    array.push(supplyZones, zoneTop)
+    
+    if showZones
+        newBox = box.new(bar_index - swingLength, zoneBottom, bar_index + 20, zoneTop, bgcolor=color.new(color.red, 85), border_color=color.red)
+        array.push(supplyBoxes, newBox)
+
+addDemandZone(zoneTop, zoneBottom) =>
+    if array.size(demandZones) >= maxZones * 2
+        array.shift(demandZones)
+        array.shift(demandZones)
+        oldBox = array.shift(demandBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+    
+    array.push(demandZones, zoneBottom)
+    array.push(demandZones, zoneTop)
+    
+    if showZones
+        newBox = box.new(bar_index - swingLength, zoneBottom, bar_index + 20, zoneTop, bgcolor=color.new(color.green, 85), border_color=color.green)
+        array.push(demandBoxes, newBox)
+
+// Optimized zone proximity check
+nearSupplyZone() =>
+    result = false
+    zoneCount = array.size(supplyZones) / 2
+    if zoneCount > 0
+        for i = 0 to zoneCount - 1 by 1
+            zoneBottom = array.get(supplyZones, i * 2)
+            zoneTop = array.get(supplyZones, i * 2 + 1)
+            if close >= zoneBottom and close <= zoneTop
+                result := true
+                break
+    result
+
+nearDemandZone() =>
+    result = false
+    zoneCount = array.size(demandZones) / 2
+    if zoneCount > 0
+        for i = 0 to zoneCount - 1 by 1
+            zoneBottom = array.get(demandZones, i * 2)
+            zoneTop = array.get(demandZones, i * 2 + 1)
+            if close >= zoneBottom and close <= zoneTop
+                result := true
+                break
+    result
+
+// ============================================================================
+// SUPPLY & DEMAND ZONE DETECTION
+// ============================================================================
+
+swingHigh = ta.pivothigh(high, swingLength, swingLength)
+swingLow = ta.pivotlow(low, swingLength, swingLength)
+
+// Create supply zones with memory optimization
+if not na(swingHigh) and wickRejectionStrength(high[swingLength], low[swingLength], open[swingLength], close[swingLength], true)
+    zoneTop = swingHigh * 1.002
+    zoneBottom = swingHigh * 0.998
+    addSupplyZone(zoneTop, zoneBottom)
+
+// Create demand zones with memory optimization
+if not na(swingLow) and wickRejectionStrength(high[swingLength], low[swingLength], open[swingLength], close[swingLength], false)
+    zoneTop = swingLow * 1.002
+    zoneBottom = swingLow * 0.998
+    addDemandZone(zoneTop, zoneBottom)
+
+// ============================================================================
+// LIQUIDITY SWEEP DETECTION
+// ============================================================================
+
+// Cached high/low calculations
+recentHigh = ta.highest(high, sweepLookback)
+recentLow = ta.lowest(low, sweepLookback)
+
+// Optimized sweep detection
+highBreakout = high > recentHigh[1] and high[1] <= recentHigh[1]
+lowBreakout = low < recentLow[1] and low[1] >= recentLow[1]
+
+// Sweep distance calculations
+sweepDistance = highBreakout ? (high - recentHigh[1]) / recentHigh[1] * 100 : 0.0
+sweepDistanceLow = lowBreakout ? (recentLow[1] - low) / recentLow[1] * 100 : 0.0
+
+// Bullish sweep detection with validation
+if lowBreakout and sweepDistanceLow >= minSweepDistance and close > recentLow[1]
+    bullishSweep := true
+    sweepLevel := recentLow[1]
+    sweepBar := bar_index
+
+// Bearish sweep detection with validation
+if highBreakout and sweepDistance >= minSweepDistance and close < recentHigh[1]
+    bearishSweep := true
+    sweepLevel := recentHigh[1]
+    sweepBar := bar_index
+
+// Reset sweep flags
+if bullishSweep and bar_index > sweepBar + sweepConfirmBars
+    bullishSweep := false
+if bearishSweep and bar_index > sweepBar + sweepConfirmBars
+    bearishSweep := false
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+// Cached conditions
+priceAbovePrevClose = close > nz(prevDayClose, close)
+priceBelowPrevClose = close < nz(prevDayClose, close)
+volumeConfirmation = volume > volume_ma
+bullishCandle = close > open
+bearishCandle = close < open
+
+// Entry conditions with input validation
+longCondition = bullishSweep and nearDemandZone() and priceAbovePrevClose and inTradingSession and strategy.opentrades < maxTrades and bullishCandle and not na(sweepLevel)
+
+shortCondition = bearishSweep and nearSupplyZone() and priceBelowPrevClose and inTradingSession and strategy.opentrades < maxTrades and bearishCandle and not na(sweepLevel)
+
+// ============================================================================
+// POSITION SIZING & RISK MANAGEMENT
+// ============================================================================
+
+// Secure position sizing with bounds checking
+calculatePositionSize(entryPrice, stopLoss) =>
+    if na(entryPrice) or na(stopLoss) or entryPrice <= 0 or stopLoss <= 0
+        0.0
+    else
+        riskAmount = strategy.equity * (riskPercent / 100)
+        stopDistance = math.abs(entryPrice - stopLoss)
+        positionSize = stopDistance > 0 ? riskAmount / stopDistance : 0.0
+        math.max(0.0, positionSize)
+
+// Stop loss and take profit with bounds checking
+longStopLoss = not na(sweepLevel) ? sweepLevel * 0.999 : close * 0.99
+longTakeProfit = close + math.max(atr14, (close - longStopLoss)) * rewardRiskRatio
+
+shortStopLoss = not na(sweepLevel) ? sweepLevel * 1.001 : close * 1.01
+shortTakeProfit = close - math.max(atr14, (shortStopLoss - close)) * rewardRiskRatio
+
+// ============================================================================
+// STRATEGY EXECUTION
+// ============================================================================
+
+if longCondition
+    posSize = calculatePositionSize(close, longStopLoss)
+    if posSize > 0
+        strategy.entry("Long", strategy.long, qty=posSize)
+        strategy.exit("Long Exit", "Long", stop=longStopLoss, limit=longTakeProfit)
+
+if shortCondition
+    posSize = calculatePositionSize(close, shortStopLoss)
+    if posSize > 0
+        strategy.entry("Short", strategy.short, qty=posSize)
+        strategy.exit("Short Exit", "Short", stop=shortStopLoss, limit=shortTakeProfit)
+
+// Emergency exit conditions
+if strategy.opentrades > 0
+    if strategy.position_size > 0 and close < longStopLoss * 0.995
+        strategy.close("Long", comment="Emergency Exit")
+    if strategy.position_size < 0 and close > shortStopLoss * 1.005
+        strategy.close("Short", comment="Emergency Exit")
+
+// ============================================================================
+// VISUAL ELEMENTS
+// ============================================================================
+
+// Previous day levels with null checks
+plot(showPrevLevels and not na(prevDayHigh) ? prevDayHigh : na, "Prev Day High", color.red, style=plot.style_line, linewidth=1)
+plot(showPrevLevels and not na(prevDayLow) ? prevDayLow : na, "Prev Day Low", color.green, style=plot.style_line, linewidth=1)
+plot(showPrevLevels and not na(prevDayClose) ? prevDayClose : na, "Prev Day Close", color.blue, style=plot.style_line, linewidth=2)
+
+// Session levels with null checks
+plot(not na(sessionHigh) ? sessionHigh : na, "Session High", color.orange, style=plot.style_circles)
+plot(not na(sessionLow) ? sessionLow : na, "Session Low", color.purple, style=plot.style_circles)
+
+// Sweep markers with label limits
+plotshape(showSweeps and bullishSweep, "Bullish Sweep", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(showSweeps and bearishSweep, "Bearish Sweep", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// Entry signals with reduced frequency
+plotshape(longCondition, "Long Entry", shape.labelup, location.belowbar, color.new(color.green, 0), text="L", textcolor=color.white, size=size.small)
+plotshape(shortCondition, "Short Entry", shape.labeldown, location.abovebar, color.new(color.red, 0), text="S", textcolor=color.white, size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(longCondition, "Long Entry Signal", "Bullish liquidity sweep with demand zone confirmation")
+alertcondition(shortCondition, "Short Entry Signal", "Bearish liquidity sweep with supply zone confirmation")
+
+// ============================================================================
+// PERFORMANCE TABLE (OPTIMIZED)
+// ============================================================================
+
+if barstate.islast and barstate.isconfirmed
+    var table infoTable = table.new(position.top_right, 2, 6, bgcolor=color.white, border_width=1)
+    
+    winRate = strategy.wintrades > 0 ? strategy.wintrades / (strategy.wintrades + strategy.losstrades) * 100 : 0
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0
+    
+    table.cell(infoTable, 0, 0, "Win Rate", text_color=color.black, bgcolor=color.gray)
+    table.cell(infoTable, 1, 0, str.tostring(winRate, "#.#") + "%", text_color=color.black)
+    
+    table.cell(infoTable, 0, 1, "Profit Factor", text_color=color.black)
+    table.cell(infoTable, 1, 1, str.tostring(profitFactor, "#.##"), text_color=color.black)
+    
+    table.cell(infoTable, 0, 2, "Total Trades", text_color=color.black)
+    table.cell(infoTable, 1, 2, str.tostring(strategy.closedtrades), text_color=color.black)
+    
+    table.cell(infoTable, 0, 3, "Risk/Trade", text_color=color.black)
+    table.cell(infoTable, 1, 3, str.tostring(riskPercent) + "%", text_color=color.black)
+    
+    table.cell(infoTable, 0, 4, "Open Trades", text_color=color.black)
+    table.cell(infoTable, 1, 4, str.tostring(strategy.opentrades), text_color=color.black)
+    
+    table.cell(infoTable, 0, 5, "Net P&L", text_color=color.black)
+    table.cell(infoTable, 1, 5, str.tostring(strategy.netprofit, "#"), text_color=strategy.netprofit > 0 ? color.green : color.red)
